@@ -19,10 +19,14 @@ on:
         description: "Optional .tar.gz of a clang toolchain (e.g. an AOSP prebuilt). Blank = Ubuntu's clang"
         required: false
         default: ""
-      suppress_warnings:
-        description: "Build with KCFLAGS=-w (helps when a newer clang turns old-code warnings into errors)"
-        type: boolean
-        default: false
+      warnings:
+        description: "How to treat compiler warnings (newer clang flags old Samsung code)"
+        type: choice
+        options:
+          - no-error   # keep warnings visible in the log, but don't fail on them
+          - strict     # use the kernel's own -Werror settings
+          - silence    # -w: hide warnings entirely (last resort)
+        default: no-error
 
 env:
   # Kernel source lives in this repo, in this folder
@@ -131,9 +135,10 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             CONFIG_SECTION_MISMATCH_WARN_ONLY=y
           )
-          if [ "${{ inputs.suppress_warnings }}" = "true" ]; then
-            MAKE_ARGS+=(KCFLAGS=-w)
-          fi
+          case "${{ inputs.warnings }}" in
+            no-error) MAKE_ARGS+=(KCFLAGS=-Wno-error) ;;
+            silence)  MAKE_ARGS+=(KCFLAGS=-w) ;;
+          esac
           make "${MAKE_ARGS[@]}" "$DEFCONFIG"
           make -j"$(nproc)" "${MAKE_ARGS[@]}" 2>&1 | tee build.log
           test -f out/arch/arm64/boot/Image
