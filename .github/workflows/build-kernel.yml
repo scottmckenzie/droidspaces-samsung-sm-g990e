@@ -1,0 +1,197 @@
+name: Build Galaxy S21 FE (SM-G990E, Exynos 2100 / r9s) kernel (KernelSU-Next + Droidspaces)
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig, relative to arch/arm64/configs (blank = read it from the source's build_kernel.sh)"
+        required: false
+        default: "exynos2100-r9sxxx_defconfig"
+      stock_boot_url:
+        description: "Direct URL to your stock boot.img or boot.img.lz4 (same firmware as the phone). Blank = only output Image"
+        required: false
+        default: ""
+      ksu_ref:
+        description: "KernelSU-Next setup.sh argument (non-GKI kernels need 'legacy')"
+        required: true
+        default: "legacy"
+      clang_url:
+        description: "Optional .tar.gz of a clang toolchain (e.g. an AOSP prebuilt). Blank = Ubuntu's clang"
+        required: false
+        default: ""
+      suppress_warnings:
+        description: "Build with KCFLAGS=-w (helps when a newer clang turns old-code warnings into errors)"
+        type: boolean
+        default: false
+
+env:
+  # Kernel source lives in this repo, in this folder
+  KERNEL_DIR: kernel
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout repo (kernel source + config fragments + patches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check kernel source is present
+        run: |
+          test -f "$KERNEL_DIR/Makefile" || {
+            echo "::error::No Makefile in $KERNEL_DIR/. Put the kernel source there (Makefile at $KERNEL_DIR/Makefile)."
+            exit 1
+          }
+          head -n 5 "$KERNEL_DIR/Makefile"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl unzip lz4 bc bison flex cpio rsync python3 libssl-dev libelf-dev \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            clang lld llvm
+
+      - name: Set up custom clang (optional)
+        if: ${{ inputs.clang_url != '' }}
+        run: |
+          mkdir -p "$HOME/clang"
+          curl -fL "${{ inputs.clang_url }}" | tar -xz -C "$HOME/clang"
+          CLANG_BIN=$(dirname "$(find "$HOME/clang" -type f -name clang -path '*/bin/*' | head -1)")
+          echo "Using clang from $CLANG_BIN"
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+
+      - name: Resolve defconfig and Samsung build variables
+        run: |
+          cd "$KERNEL_DIR"
+          DEFCONFIG="${{ inputs.defconfig }}"
+          if [ -z "$DEFCONFIG" ] && [ -f build_kernel.sh ]; then
+            DEFCONFIG=$(grep -o '[A-Za-z0-9_./-]*_defconfig' build_kernel.sh | head -1)
+          fi
+          test -f "arch/arm64/configs/$DEFCONFIG" || {
+            echo "::error::Defconfig arch/arm64/configs/$DEFCONFIG not found. Candidates:"
+            find arch/arm64/configs -name '*r9s*' -o -name '*2100*' | sed 's#arch/arm64/configs/##'
+            exit 1
+          }
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+          # Samsung's build_kernel.sh exports PLATFORM_VERSION / ANDROID_MAJOR_VERSION /
+          # SEC_BUILD_CONF_VENDOR_BUILD_OS, which some Samsung Kconfig/Makefiles read.
+          if [ -f build_kernel.sh ]; then
+            grep -E '^export [A-Z_]+=' build_kernel.sh | grep -v '^export ARCH=' \
+              | sed 's/^export //' | tee -a "$GITHUB_ENV"
+          fi
+
+      - name: Apply extra patches
+        run: |
+          cd "$KERNEL_DIR"
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "Applying $(basename "$p")"
+            patch -p1 --forward < "$p"
+          done
+
+      - name: Add KernelSU-Next (non-GKI / legacy)
+        run: |
+          cd "$KERNEL_DIR"
+          if [ -e drivers/kernelsu ]; then
+            echo "::error::drivers/kernelsu already exists; this source already contains KernelSU. Remove it or skip this step."
+            exit 1
+          fi
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s ${{ inputs.ksu_ref }}
+          echo "---- verify KernelSU-Next is wired in ----"
+          ls -l drivers/kernelsu
+          grep -n "kernelsu" drivers/Makefile
+          grep -n "kernelsu" drivers/Kconfig
+
+      - name: Merge config fragments into the defconfig
+        run: |
+          TARGET="$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG"
+          for frag in ksu.config samsung.config droidspaces.config; do
+            echo "" >> "$TARGET"
+            echo "# ---- $frag ----" >> "$TARGET"
+            grep -v '^\s*$' "$GITHUB_WORKSPACE/configs/$frag" >> "$TARGET"
+          done
+          tail -n 60 "$TARGET"
+
+      - name: Build kernel
+        run: |
+          cd "$KERNEL_DIR"
+          clang --version | head -1
+          export ARCH=arm64 SUBARCH=arm64
+          MAKE_ARGS=(
+            O=out ARCH=arm64
+            CC=clang REAL_CC=clang LD=ld.lld
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y
+          )
+          if [ "${{ inputs.suppress_warnings }}" = "true" ]; then
+            MAKE_ARGS+=(KCFLAGS=-w)
+          fi
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+          test -f out/arch/arm64/boot/Image
+
+      - name: Check requested options made it into .config
+        run: |
+          cd "$KERNEL_DIR"
+          MISSING=0
+          for frag in ksu.config droidspaces.config; do
+            while IFS= read -r line; do
+              case "$line" in ''|\#*) continue ;; esac
+              if ! grep -qx "$line" out/.config; then
+                echo "::warning::$line did not survive (unmet dependency or conflicting option)"
+                MISSING=1
+              fi
+            done < "$GITHUB_WORKSPACE/configs/$frag"
+          done
+          grep -qx "CONFIG_KSU=y" out/.config || { echo "::error::CONFIG_KSU is not enabled"; exit 1; }
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
+          strings out/arch/arm64/boot/Image | grep -i -m3 kernelsu \
+            || { echo "::error::No KernelSU strings in the built Image"; exit 1; }
+          if [ "$MISSING" = 0 ]; then echo "All requested options present."; fi
+
+      - name: Repack stock boot.img with the new kernel
+        if: ${{ inputs.stock_boot_url != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/repack" dist
+          cd "$RUNNER_TEMP/repack"
+          curl -fL "${{ inputs.stock_boot_url }}" -o stock_boot
+          if [ "$(head -c4 stock_boot | od -An -tx1 | tr -d ' ')" = "04224d18" ]; then
+            lz4 -d stock_boot boot.img
+          else
+            mv stock_boot boot.img
+          fi
+          # magiskboot from the latest Magisk release (x86_64 build runs on the runner)
+          APK_URL=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | grep -o '"browser_download_url": *"[^"]*\.apk"' | head -1 | cut -d'"' -f4)
+          curl -fL "$APK_URL" -o magisk.apk
+          unzip -jo magisk.apk lib/x86_64/libmagiskboot.so
+          mv libmagiskboot.so magiskboot && chmod +x magiskboot
+          ./magiskboot unpack boot.img
+          cp "$GITHUB_WORKSPACE/$KERNEL_DIR/out/arch/arm64/boot/Image" kernel
+          ./magiskboot repack boot.img new-boot.img
+          mv new-boot.img "$GITHUB_WORKSPACE/dist/boot.img"
+          cd "$GITHUB_WORKSPACE/dist"
+          tar --format=ustar -cf boot.tar boot.img     # flash in Odin's AP slot
+          ls -lh
+
+      - name: Collect outputs
+        run: |
+          mkdir -p dist
+          cp "$KERNEL_DIR/out/arch/arm64/boot/Image" dist/
+          cp "$KERNEL_DIR/out/.config" dist/kernel.config
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21fe-kernel-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
