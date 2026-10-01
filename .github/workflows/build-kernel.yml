@@ -157,8 +157,10 @@ jobs:
           cd "$KERNEL_DIR"
           clang --version | head -1
           export ARCH=arm64 SUBARCH=arm64
+          # Built in-tree (no O=out), like Samsung's build_kernel.sh: several Samsung
+          # Makefiles use include paths relative to the source root.
           MAKE_ARGS=(
-            O=out ARCH=arm64
+            ARCH=arm64
             CC=clang REAL_CC=clang LD=ld.lld
             AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
             CLANG_TRIPLE=aarch64-linux-gnu-
@@ -187,7 +189,7 @@ jobs:
             exit 1
           fi
           echo "Warnings: $(grep -c 'warning:' build.log || true)"
-          test -f out/arch/arm64/boot/Image
+          test -f arch/arm64/boot/Image
 
       - name: Upload build logs on failure
         if: failure()
@@ -206,15 +208,15 @@ jobs:
           for frag in ksu.config droidspaces.config; do
             while IFS= read -r line; do
               case "$line" in ''|\#*) continue ;; esac
-              if ! grep -qx "$line" out/.config; then
+              if ! grep -qx "$line" .config; then
                 echo "::warning::$line did not survive (unmet dependency or conflicting option)"
                 MISSING=1
               fi
             done < "$GITHUB_WORKSPACE/configs/$frag"
           done
-          grep -qx "CONFIG_KSU=y" out/.config || { echo "::error::CONFIG_KSU is not enabled"; exit 1; }
-          strings out/arch/arm64/boot/Image | grep -m1 "Linux version"
-          strings out/arch/arm64/boot/Image | grep -i -m3 kernelsu \
+          grep -qx "CONFIG_KSU=y" .config || { echo "::error::CONFIG_KSU is not enabled"; exit 1; }
+          strings arch/arm64/boot/Image | grep -m1 "Linux version"
+          strings arch/arm64/boot/Image | grep -i -m3 kernelsu \
             || { echo "::error::No KernelSU strings in the built Image"; exit 1; }
           if [ "$MISSING" = 0 ]; then echo "All requested options present."; fi
 
@@ -236,7 +238,7 @@ jobs:
           unzip -jo magisk.apk lib/x86_64/libmagiskboot.so
           mv libmagiskboot.so magiskboot && chmod +x magiskboot
           ./magiskboot unpack boot.img
-          cp "$GITHUB_WORKSPACE/$KERNEL_DIR/out/arch/arm64/boot/Image" kernel
+          cp "$GITHUB_WORKSPACE/$KERNEL_DIR/arch/arm64/boot/Image" kernel
           ./magiskboot repack boot.img new-boot.img
           mv new-boot.img "$GITHUB_WORKSPACE/dist/boot.img"
           cd "$GITHUB_WORKSPACE/dist"
@@ -246,8 +248,8 @@ jobs:
       - name: Collect outputs
         run: |
           mkdir -p dist
-          cp "$KERNEL_DIR/out/arch/arm64/boot/Image" dist/
-          cp "$KERNEL_DIR/out/.config" dist/kernel.config
+          cp "$KERNEL_DIR/arch/arm64/boot/Image" dist/
+          cp "$KERNEL_DIR/.config" dist/kernel.config
           ls -lh dist
 
       - name: Upload artifact
