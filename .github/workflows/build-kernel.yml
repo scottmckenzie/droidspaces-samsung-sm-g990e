@@ -15,8 +15,16 @@ on:
         description: "KernelSU-Next setup.sh argument (non-GKI kernels need 'legacy')"
         required: true
         default: "legacy"
+      toolchain:
+        description: "Compiler: the clang bundled in kernel/toolchain (Samsung's own), Ubuntu's clang, or clang_url"
+        type: choice
+        options:
+          - bundled
+          - ubuntu
+          - url
+        default: bundled
       clang_url:
-        description: "Optional .tar.gz of a clang toolchain (e.g. an AOSP prebuilt). Blank = Ubuntu's clang"
+        description: "Only for toolchain=url: .tar.gz of a clang toolchain"
         required: false
         default: ""
       warnings:
@@ -59,14 +67,37 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             clang lld llvm
 
-      - name: Set up custom clang (optional)
-        if: ${{ inputs.clang_url != '' }}
+      - name: Set up compiler
         run: |
-          mkdir -p "$HOME/clang"
-          curl -fL "${{ inputs.clang_url }}" | tar -xz -C "$HOME/clang"
-          CLANG_BIN=$(dirname "$(find "$HOME/clang" -type f -name clang -path '*/bin/*' | head -1)")
-          echo "Using clang from $CLANG_BIN"
-          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          case "${{ inputs.toolchain }}" in
+            bundled)
+              CLANG=$(find "$KERNEL_DIR/toolchain" -type f -path '*/clang-r*/bin/clang-[0-9]*' 2>/dev/null | head -1)
+              [ -n "$CLANG" ] || { echo "::error::No bundled clang found under $KERNEL_DIR/toolchain"; exit 1; }
+              BIN="$GITHUB_WORKSPACE/$(dirname "$CLANG")"
+              chmod +x "$BIN"/* || true
+              # Recreate the clang -> clang-NN symlink if it didn't survive
+              [ -e "$BIN/clang" ] || ln -s "$(basename "$CLANG")" "$BIN/clang"
+              echo "$BIN" >> "$GITHUB_PATH"
+              ;;
+            url)
+              [ -n "${{ inputs.clang_url }}" ] || { echo "::error::toolchain=url needs clang_url"; exit 1; }
+              mkdir -p "$HOME/clang"
+              curl -fL "${{ inputs.clang_url }}" | tar -xz -C "$HOME/clang"
+              BIN=$(dirname "$(find "$HOME/clang" -type f -name 'clang-[0-9]*' -path '*/bin/*' | head -1)")
+              echo "$BIN" >> "$GITHUB_PATH"
+              ;;
+            ubuntu)
+              BIN=/usr/bin
+              ;;
+          esac
+          echo "Using toolchain from $BIN"
+          "$BIN/clang" --version || {
+            echo "::error::clang failed to run. If it's a missing shared library (e.g. libtinfo.so.5), try runs-on: ubuntu-22.04."
+            exit 1
+          }
+          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+            [ -x "$BIN/$t" ] && echo "  found $t" || echo "  $t not in $BIN, falling back to Ubuntu's"
+          done
 
       - name: Resolve defconfig and Samsung build variables
         run: |
@@ -136,12 +167,37 @@ jobs:
             CONFIG_SECTION_MISMATCH_WARN_ONLY=y
           )
           case "${{ inputs.warnings }}" in
-            no-error) MAKE_ARGS+=(KCFLAGS=-Wno-error) ;;
+            # Clang 16+ makes some old-C warnings errors by default; -Wno-error alone
+            # doesn't downgrade those, so name them explicitly.
+            no-error) MAKE_ARGS+=("KCFLAGS=-Wno-error -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types") ;;
             silence)  MAKE_ARGS+=(KCFLAGS=-w) ;;
           esac
           make "${MAKE_ARGS[@]}" "$DEFCONFIG"
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+          set +e
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" > build.log 2>&1
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            # Retry single-threaded so the real error isn't buried in parallel output
+            make -j1 "${MAKE_ARGS[@]}" > build-j1.log 2>&1 || true
+            echo "================ BUILD FAILED: errors ================"
+            grep -n -E "error:|Error [0-9]+|\*\*\*" build-j1.log | head -n 40
+            echo "================ last 40 lines ================"
+            tail -n 40 build-j1.log
+            exit 1
+          fi
+          echo "Warnings: $(grep -c 'warning:' build.log || true)"
           test -f out/arch/arm64/boot/Image
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            ${{ env.KERNEL_DIR }}/build.log
+            ${{ env.KERNEL_DIR }}/build-j1.log
+          if-no-files-found: ignore
 
       - name: Check requested options made it into .config
         run: |
